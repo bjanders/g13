@@ -2,7 +2,14 @@ package g13
 
 import (
 	"bytes"
+	"image"
 	"image/color"
+
+	"golang.org/x/image/font"
+	"golang.org/x/image/font/basicfont"
+	"golang.org/x/image/math/fixed"
+
+	"github.com/pbnjay/pixfont"
 
 	"github.com/google/gousb"
 )
@@ -14,6 +21,11 @@ const (
 
 	USBEndpointG13Key = 1
 	USBEndpointG13LCD = 2
+)
+
+const (
+	LCDSizeX = 160
+	LCDSizeY = 48
 )
 
 // G13 keys
@@ -58,6 +70,13 @@ const (
 	Light
 	Light2
 	Undef3
+)
+
+const (
+	LEDM1 = 0x1
+	LEDM2 = 0x2
+	LEDM3 = 0x4
+	LEDMR = 0x8
 )
 
 var Keys = []string{
@@ -105,13 +124,18 @@ var Keys = []string{
 
 // G13 is the G13
 type G13 struct {
-	ctx        *gousb.Context
-	device     *gousb.Device
-	intf       *gousb.Interface
-	intfDone   func()
-	inEndpoint *gousb.InEndpoint
-	state      [8]byte
-	color      color.RGBA
+	ctx         *gousb.Context
+	device      *gousb.Device
+	intf        *gousb.Interface
+	intfDone    func()
+	inEndpoint  *gousb.InEndpoint
+	outEndpoint *gousb.OutEndpoint
+	state       [8]byte
+	color       color.RGBA
+	KeyCh       chan KeyState
+	StickCh     chan StickState
+	BacklightCh chan bool
+	LCD         *image.Gray16
 }
 
 type KeyState struct {
@@ -140,31 +164,20 @@ func NewG13() (*G13, error) {
 		return nil, err
 	}
 	g13.inEndpoint, err = g13.intf.InEndpoint(USBEndpointG13Key)
+	g13.outEndpoint, err = g13.intf.OutEndpoint(USBEndpointG13LCD)
 	g13.color = color.RGBA{255, 255, 255, 255}
 	g13.SetColor(g13.color)
+	g13.KeyCh = make(chan KeyState)
+	g13.StickCh = make(chan StickState)
+	g13.BacklightCh = make(chan bool)
+	g13.LCD = image.NewGray16(image.Rect(0, 0, LCDSizeX, LCDSizeY))
+	go g13.readKeys()
 
 	return &g13, nil
 }
 
-func (g13 *G13) WatchKeys() (chan KeyState, chan StickState, chan bool) {
-	keyCh := make(chan KeyState)
-	stickCh := make(chan StickState)
-	backlightCh := make(chan bool)
-	go readKeys(g13, keyCh, stickCh, backlightCh)
-	return keyCh, stickCh, backlightCh
-}
-
-func (g13 *G13) SetModeLEDs(leds byte) {
+func (g13 *G13) SetMLEDs(leds byte) {
 	var data = [5]byte{5, leds}
-
-	g13.device.Control(gousb.ControlOut|gousb.ControlClass|gousb.ControlInterface, 0x09,
-		0x305, 0x00, data[:])
-
-}
-
-func (g13 *G13) SetMode(b, v byte) {
-	var data = [5]byte{5}
-	data[b] = v
 
 	g13.device.Control(gousb.ControlOut|gousb.ControlClass|gousb.ControlInterface, 0x09,
 		0x305, 0x00, data[:])
@@ -177,7 +190,7 @@ func (g13 *G13) SetColor(c color.Color) error {
 	var data = [5]byte{5, rgba.R, rgba.G, rgba.B, rgba.A}
 
 	g13.device.Control(gousb.ControlOut|gousb.ControlClass|gousb.ControlInterface, 0x09,
-		0x307, 0x00, data[:])
+		0x0307, 0x00, data[:])
 	g13.color = rgba
 	return nil
 }
@@ -186,7 +199,46 @@ func (g13 *G13) Color() color.Color {
 	return g13.color
 }
 
-func readKeys(g13 *G13, keyCh chan KeyState, stickCh chan StickState, backlightCh chan bool) error {
+func (g13 *G13) AddStringx(s string, x, y int) {
+	p := fixed.Point26_6{fixed.Int26_6(x * 64), fixed.Int26_6(y * 64)}
+	d := &font.Drawer{
+		Dst:  g13.LCD,
+		Src:  image.NewUniform(color.Black),
+		Face: basicfont.Face7x13,
+		Dot:  p,
+	}
+	d.DrawString(s)
+}
+
+func (g13 *G13) AddString(s string, x, y int) {
+	pixfont.DrawString(g13.LCD, x, y, s, color.Black)
+}
+
+func (g13 *G13) DrawLCD() {
+	var buffer [32 + 960]byte
+	buffer[0] = 0x03
+	for x := g13.LCD.Rect.Min.X; x < g13.LCD.Rect.Max.X; x++ {
+		for y := g13.LCD.Rect.Min.Y; y < g13.LCD.Rect.Max.Y; y++ {
+			gray := g13.LCD.Gray16At(x, y)
+			// FIX: configurable threshold
+			threshold := 0x9fff
+			if gray.Y > uint16(threshold) {
+				i := x + y/8*LCDSizeX
+				var m byte = 1 << (y & 7)
+				buffer[i+32] |= m
+			}
+		}
+	}
+	g13.outEndpoint.Write(buffer[:])
+}
+
+func (g13 *G13) ClearLCD() {
+	for i := range g13.LCD.Pix {
+		g13.LCD.Pix[i] = 0
+	}
+}
+
+func (g13 *G13) readKeys() error {
 	var data [8]byte
 
 	stream, err := g13.inEndpoint.NewStream(8, 1)
@@ -202,7 +254,7 @@ func readKeys(g13 *G13, keyCh chan KeyState, stickCh chan StickState, backlightC
 		}
 		if !bytes.Equal(data[1:3], g13.state[1:3]) {
 			select {
-			case stickCh <- StickState{int(data[1]), int(data[2])}:
+			case g13.StickCh <- StickState{int(data[1]), int(data[2])}:
 			default:
 			}
 		}
@@ -216,12 +268,12 @@ func readKeys(g13 *G13, keyCh chan KeyState, stickCh chan StickState, backlightC
 					case Light2:
 					case LightState:
 						select {
-						case backlightCh <- d != 0:
+						case g13.BacklightCh <- d != 0:
 						default:
 						}
 					default:
 						select {
-						case keyCh <- KeyState{key, d != 0}:
+						case g13.KeyCh <- KeyState{key, d != 0}:
 						default:
 						}
 					}
